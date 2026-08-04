@@ -1,0 +1,6 @@
+*.csv
+*.json
+*.clixml
+*.log
+.vscode/
+.idea/
