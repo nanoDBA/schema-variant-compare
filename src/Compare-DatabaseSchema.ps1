@@ -3,240 +3,231 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [string[]] $SqlInstance,
-
-    [Parameter(Mandatory)]
-    [string] $Database,
-
+    [Parameter(Mandatory)][string[]] $SqlInstance,
+    [Parameter(Mandatory)][string] $Database,
     [string] $CollectorPath = (Join-Path $PSScriptRoot 'sqlserver/Get-SchemaManifest.sql'),
-
     [PSCredential] $SqlCredential
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Get-Sha256Hex {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][AllowEmptyString()][string] $Text)
+$CollectorVersion = '0.3.0'
+$ManifestFormatVersion = '2'
+$CanonicalizationVersion = '2'
 
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
-    $hash = [Security.Cryptography.SHA256]::HashData($bytes)
-    [Convert]::ToHexString($hash)
+$ComparisonPolicy = [ordered]@{
+    TableColumnOrder          = 'Ignore'
+    IndexKeyColumnOrder       = 'Strict'
+    IndexIncludeColumnOrder   = 'Ignore'
+    ConstraintColumnOrder     = 'Strict'
+    ExplicitConstraintNames   = 'Compare'
+    SystemConstraintNames     = 'Ignore'
+    DisabledIndexes           = 'Compare'
+    IndexStorageProperties    = 'Ignore'
+    XmlIndexes                = 'IgnoreWithVerboseWarning'
+    SpatialIndexes            = 'IgnoreWithVerboseWarning'
+    FullTextIndexes           = 'IgnoreWithVerboseWarning'
+    TemporalAttributes        = 'IgnoreWithVerboseWarning'
+    MemoryOptimizedAttributes = 'IgnoreWithVerboseWarning'
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Text)
+    [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($Text)
+        )
+    )
+}
+
+function Get-PolicyHash {
+    param([Parameter(Mandatory)][System.Collections.IDictionary] $Policy)
+    $signature = $Policy.GetEnumerator() |
+        Sort-Object Key |
+        ForEach-Object { '{0}={1}' -f $_.Key,$_.Value }
+    Get-Sha256Hex -Text ($signature -join "`n")
 }
 
 function Get-ComponentKey {
-    [CmdletBinding()]
     param([Parameter(Mandatory)] $Row)
-
     '{0}|{1}|{2}|{3}|{4}|{5:D10}' -f @(
-        $Row.ObjectCategory,
-        $Row.SchemaName,
-        $Row.ObjectName,
-        $Row.ComponentCategory,
-        $Row.ComponentName,
-        [int]($Row.Ordinal ?? -1)
+        $Row.ObjectCategory,$Row.SchemaName,$Row.ObjectName,
+        $Row.ComponentCategory,$Row.ComponentName,[int]($Row.Ordinal ?? -1)
     )
 }
 
 function Get-HashSummary {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [object[]] $Rows,
-        [Parameter(Mandatory)] [string] $SourceServer,
-        [Parameter(Mandatory)] [string] $SourceDatabase
+        [Parameter(Mandatory)][object[]] $Rows,
+        [Parameter(Mandatory)][string] $SourceServer,
+        [Parameter(Mandatory)][string] $SourceDatabase,
+        [Parameter(Mandatory)][string] $PolicyHash
     )
 
-    $objectHashes = foreach ($objectGroup in $Rows | Group-Object SchemaName, ObjectCategory, ObjectName) {
-        $first = $objectGroup.Group[0]
-        $signature = $objectGroup.Group |
-            Sort-Object { Get-ComponentKey $_ } |
-            ForEach-Object { '{0}|{1}' -f (Get-ComponentKey $_), $_.ComponentHash }
-
+    $objects = foreach ($g in $Rows | Group-Object SchemaName,ObjectCategory,ObjectName) {
+        $first = $g.Group[0]
+        $sig = $g.Group | Sort-Object { Get-ComponentKey $_ } |
+            ForEach-Object { '{0}|{1}' -f (Get-ComponentKey $_),$_.ComponentHash }
         [pscustomobject]@{
-            SourceServer   = $SourceServer
-            SourceDatabase = $SourceDatabase
-            SchemaName     = $first.SchemaName
-            ObjectCategory = $first.ObjectCategory
-            ObjectName     = $first.ObjectName
-            ObjectHash     = Get-Sha256Hex -Text ($signature -join "`n")
-            ComponentCount = $objectGroup.Count
+            SourceServer=$SourceServer; SourceDatabase=$SourceDatabase
+            SchemaName=$first.SchemaName; ObjectCategory=$first.ObjectCategory
+            ObjectName=$first.ObjectName; ObjectHash=Get-Sha256Hex ($sig -join "`n")
+            ComponentCount=$g.Count; ComparisonPolicyHash=$PolicyHash
+            ManifestFormatVersion=$ManifestFormatVersion
+            CanonicalizationVersion=$CanonicalizationVersion
         }
     }
 
-    $schemaHashes = foreach ($schemaGroup in $objectHashes | Group-Object SchemaName) {
-        $signature = $schemaGroup.Group |
-            Sort-Object ObjectCategory, ObjectName |
-            ForEach-Object { '{0}|{1}|{2}' -f $_.ObjectCategory, $_.ObjectName, $_.ObjectHash }
-
+    $schemas = foreach ($g in $objects | Group-Object SchemaName) {
+        $sig = $g.Group | Sort-Object ObjectCategory,ObjectName |
+            ForEach-Object { '{0}|{1}|{2}' -f $_.ObjectCategory,$_.ObjectName,$_.ObjectHash }
         [pscustomobject]@{
-            SourceServer   = $SourceServer
-            SourceDatabase = $SourceDatabase
-            SchemaName     = $schemaGroup.Name
-            SchemaHash     = Get-Sha256Hex -Text ($signature -join "`n")
-            ObjectCount    = $schemaGroup.Count
+            SourceServer=$SourceServer; SourceDatabase=$SourceDatabase
+            SchemaName=$g.Name; SchemaHash=Get-Sha256Hex ($sig -join "`n")
+            ObjectCount=$g.Count; ComparisonPolicyHash=$PolicyHash
+            ManifestFormatVersion=$ManifestFormatVersion
+            CanonicalizationVersion=$CanonicalizationVersion
         }
     }
 
-    $databaseSignature = $schemaHashes |
-        Sort-Object SchemaName |
-        ForEach-Object { '{0}|{1}' -f $_.SchemaName, $_.SchemaHash }
-
-    $databaseHash = [pscustomobject]@{
-        SourceServer   = $SourceServer
-        SourceDatabase = $SourceDatabase
-        DatabaseHash   = Get-Sha256Hex -Text ($databaseSignature -join "`n")
-        SchemaCount    = @($schemaHashes).Count
-        ObjectCount    = @($objectHashes).Count
-        ComponentCount = @($Rows).Count
-    }
+    $dbSig = @(
+        "policy=$PolicyHash"
+        "manifest_format=$ManifestFormatVersion"
+        "canonicalization=$CanonicalizationVersion"
+        $schemas | Sort-Object SchemaName | ForEach-Object { '{0}|{1}' -f $_.SchemaName,$_.SchemaHash }
+    )
 
     [pscustomobject]@{
-        Objects  = @($objectHashes)
-        Schemas  = @($schemaHashes)
-        Database = $databaseHash
+        Objects=@($objects)
+        Schemas=@($schemas)
+        Database=[pscustomobject]@{
+            SourceServer=$SourceServer; SourceDatabase=$SourceDatabase
+            DatabaseHash=Get-Sha256Hex ($dbSig -join "`n")
+            SchemaCount=@($schemas).Count; ObjectCount=@($objects).Count
+            ComponentCount=@($Rows).Count; ComparisonPolicyHash=$PolicyHash
+            ManifestFormatVersion=$ManifestFormatVersion
+            CanonicalizationVersion=$CanonicalizationVersion
+            CollectorVersion=$CollectorVersion
+        }
     }
 }
 
 function Compare-ManifestRows {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [object[]] $Left,
-        [Parameter(Mandatory)] [object[]] $Right,
-        [Parameter(Mandatory)] [int] $LeftVariant,
-        [Parameter(Mandatory)] [int] $RightVariant
+        [Parameter(Mandatory)][object[]] $Left,
+        [Parameter(Mandatory)][object[]] $Right,
+        [Parameter(Mandatory)][int] $LeftVariant,
+        [Parameter(Mandatory)][int] $RightVariant
     )
 
-    $leftMap = @{}
-    foreach ($row in $Left) { $leftMap[(Get-ComponentKey $row)] = $row }
+    $lm=@{}; foreach($r in $Left){$lm[(Get-ComponentKey $r)]=$r}
+    $rm=@{}; foreach($r in $Right){$rm[(Get-ComponentKey $r)]=$r}
 
-    $rightMap = @{}
-    foreach ($row in $Right) { $rightMap[(Get-ComponentKey $row)] = $row }
-
-    $allKeys = @($leftMap.Keys + $rightMap.Keys | Sort-Object -Unique)
-
-    foreach ($key in $allKeys) {
-        $leftRow = $leftMap[$key]
-        $rightRow = $rightMap[$key]
-
-        $differenceType = if ($null -eq $leftRow) {
-            'ExtraInRight'
-        }
-        elseif ($null -eq $rightRow) {
-            'MissingInRight'
-        }
-        elseif ($leftRow.ComponentHash -ne $rightRow.ComponentHash) {
-            'Different'
-        }
-        else {
-            continue
-        }
-
-        $row = $leftRow ?? $rightRow
+    foreach($key in @($lm.Keys+$rm.Keys|Sort-Object -Unique)){
+        $l=$lm[$key]; $r=$rm[$key]
+        $type = if($null -eq $l){'ExtraInRight'}
+                elseif($null -eq $r){'MissingInRight'}
+                elseif($l.ComponentHash -ne $r.ComponentHash){'Different'}
+                else{continue}
+        $row=$l ?? $r
         [pscustomobject]@{
-            LeftVariant        = $LeftVariant
-            RightVariant       = $RightVariant
-            ObjectCategory     = $row.ObjectCategory
-            SchemaName         = $row.SchemaName
-            ObjectName         = $row.ObjectName
-            ComponentCategory  = $row.ComponentCategory
-            ComponentName      = $row.ComponentName
-            Ordinal            = $row.Ordinal
-            DifferenceType     = $differenceType
-            LeftDefinition     = if ($null -eq $leftRow) { $null } else { $leftRow.CanonicalDefinition }
-            RightDefinition    = if ($null -eq $rightRow) { $null } else { $rightRow.CanonicalDefinition }
-            LeftComponentHash  = if ($null -eq $leftRow) { $null } else { $leftRow.ComponentHash }
-            RightComponentHash = if ($null -eq $rightRow) { $null } else { $rightRow.ComponentHash }
+            LeftVariant=$LeftVariant; RightVariant=$RightVariant
+            ObjectCategory=$row.ObjectCategory; SchemaName=$row.SchemaName
+            ObjectName=$row.ObjectName; ComponentCategory=$row.ComponentCategory
+            ComponentName=$row.ComponentName; Ordinal=$row.Ordinal
+            DifferenceType=$type
+            LeftRawDefinition=$l?.RawDefinition
+            RightRawDefinition=$r?.RawDefinition
+            LeftDefinition=$l?.CanonicalDefinition
+            RightDefinition=$r?.CanonicalDefinition
+            LeftComponentHash=$l?.ComponentHash
+            RightComponentHash=$r?.ComponentHash
         }
     }
 }
 
-if (-not (Test-Path -LiteralPath $CollectorPath -PathType Leaf)) {
+if(-not(Test-Path -LiteralPath $CollectorPath -PathType Leaf)){
     throw "Collector not found: $CollectorPath"
 }
 
-$queryParameters = @{
-    Database        = $Database
-    File            = $CollectorPath
-    EnableException = $true
-}
-if ($SqlCredential) {
-    $queryParameters.SqlCredential = $SqlCredential
-}
+$PolicyHash=Get-PolicyHash $ComparisonPolicy
+$params=@{Database=$Database;File=$CollectorPath;EnableException=$true}
+if($SqlCredential){$params.SqlCredential=$SqlCredential}
 
-$manifest = foreach ($instance in $SqlInstance) {
-    $rows = Invoke-DbaQuery -SqlInstance $instance @queryParameters
+$Manifest=[System.Collections.Generic.List[object]]::new()
+$Warnings=[System.Collections.Generic.List[object]]::new()
 
-    foreach ($item in $rows) {
-        $definition = [string]$item.CanonicalDefinition
-        [pscustomobject]@{
-            SourceServer        = [string]$instance
-            SourceDatabase      = $Database
-            ObjectCategory      = [string]$item.ObjectCategory
-            SchemaName          = [string]$item.SchemaName
-            ObjectName          = [string]$item.ObjectName
-            ComponentCategory   = [string]$item.ComponentCategory
-            ComponentName       = [string]$item.ComponentName
-            Ordinal             = if ($null -eq $item.Ordinal) { $null } else { [int]$item.Ordinal }
-            CanonicalDefinition = $definition
-            ComponentHash       = Get-Sha256Hex -Text $definition
+foreach($instance in $SqlInstance){
+    foreach($item in Invoke-DbaQuery -SqlInstance $instance @params){
+        if([string]$item.RowType -eq 'WARNING'){
+            $w=[pscustomobject]@{
+                SourceServer=[string]$instance;SourceDatabase=$Database
+                SchemaName=[string]$item.SchemaName;ObjectName=[string]$item.ObjectName
+                WarningCode=[string]$item.WarningCode;WarningMessage=[string]$item.WarningMessage
+            }
+            $Warnings.Add($w)
+            Write-Verbose ('{0}: {1}' -f $w.WarningCode,$w.WarningMessage)
+            continue
         }
+
+        $definition=[string]$item.CanonicalDefinition
+        $Manifest.Add([pscustomobject]@{
+            SourceServer=[string]$instance;SourceDatabase=$Database
+            Engine='SQLServer';EngineMajorVersion=15
+            CollectorVersion=$CollectorVersion
+            ManifestFormatVersion=$ManifestFormatVersion
+            CanonicalizationVersion=$CanonicalizationVersion
+            ComparisonPolicyHash=$PolicyHash
+            ObjectCategory=[string]$item.ObjectCategory
+            SchemaName=[string]$item.SchemaName
+            ObjectName=[string]$item.ObjectName
+            ComponentCategory=[string]$item.ComponentCategory
+            ComponentName=[string]$item.ComponentName
+            Ordinal=if($null -eq $item.Ordinal){$null}else{[int]$item.Ordinal}
+            DiagnosticOrdinal=if($null -eq $item.DiagnosticOrdinal){$null}else{[int]$item.DiagnosticOrdinal}
+            RawDefinition=[string]$item.RawDefinition
+            CanonicalDefinition=$definition
+            ComponentHash=Get-Sha256Hex $definition
+        })
     }
 }
 
-$hashResults = foreach ($serverGroup in $manifest | Group-Object SourceServer) {
-    Get-HashSummary `
-        -Rows @($serverGroup.Group) `
-        -SourceServer $serverGroup.Name `
-        -SourceDatabase $Database
+$hashResults=foreach($g in $Manifest|Group-Object SourceServer){
+    Get-HashSummary -Rows @($g.Group) -SourceServer $g.Name -SourceDatabase $Database -PolicyHash $PolicyHash
 }
 
-$databaseSummary = @($hashResults.Database)
-$objectSummary = @($hashResults.Objects)
-$schemaSummary = @($hashResults.Schemas)
-
-$variantId = 0
-$variantSummary = foreach ($hashGroup in $databaseSummary |
-    Group-Object DatabaseHash |
-    Sort-Object -Property @(
-        @{ Expression = 'Count'; Descending = $true },
-        @{ Expression = 'Name'; Descending = $false }
-    )) {
-
-    $variantId++
-    $representative = $hashGroup.Group | Sort-Object SourceServer | Select-Object -First 1
-
+$db=@($hashResults.Database);$obj=@($hashResults.Objects);$sch=@($hashResults.Schemas)
+$id=0
+$variants=foreach($g in $db|Group-Object DatabaseHash|Sort-Object @{e='Count';Descending=$true},Name){
+    $id++
+    $rep=$g.Group|Sort-Object SourceServer|Select-Object -First 1
     [pscustomobject]@{
-        VariantId            = $variantId
-        DatabaseHash         = $hashGroup.Name
-        ServerCount          = $hashGroup.Count
-        RepresentativeServer = $representative.SourceServer
-        Members              = ($hashGroup.Group.SourceServer | Sort-Object) -join ', '
-        IsLargestVariant     = $variantId -eq 1
+        VariantId=$id;DatabaseHash=$g.Name;ServerCount=$g.Count
+        RepresentativeServer=$rep.SourceServer
+        Members=($g.Group.SourceServer|Sort-Object)-join ', '
+        IsLargestVariant=$id -eq 1;IsAuthoritative=$false
     }
 }
 
-$variantDifferences = @()
-if (@($variantSummary).Count -gt 1) {
-    $anchor = $variantSummary | Sort-Object VariantId | Select-Object -First 1
-    $leftRows = @($manifest | Where-Object SourceServer -eq $anchor.RepresentativeServer)
-
-    foreach ($target in $variantSummary | Where-Object VariantId -ne $anchor.VariantId) {
-        $rightRows = @($manifest | Where-Object SourceServer -eq $target.RepresentativeServer)
-        $variantDifferences += Compare-ManifestRows `
-            -Left $leftRows `
-            -Right $rightRows `
-            -LeftVariant $anchor.VariantId `
-            -RightVariant $target.VariantId
+$diffs=@()
+if(@($variants).Count -gt 1){
+    $anchor=$variants|Sort-Object VariantId|Select-Object -First 1
+    $left=@($Manifest|Where-Object SourceServer -eq $anchor.RepresentativeServer)
+    foreach($target in $variants|Where-Object VariantId -ne $anchor.VariantId){
+        $right=@($Manifest|Where-Object SourceServer -eq $target.RepresentativeServer)
+        $diffs+=Compare-ManifestRows -Left $left -Right $right -LeftVariant $anchor.VariantId -RightVariant $target.VariantId
     }
 }
 
 [pscustomobject]@{
-    Manifest           = @($manifest)
-    ObjectSummary      = $objectSummary
-    SchemaSummary      = $schemaSummary
-    DatabaseSummary    = $databaseSummary
-    VariantSummary     = @($variantSummary)
-    VariantDifferences = @($variantDifferences)
+    ComparisonPolicy=[pscustomobject]$ComparisonPolicy
+    PolicyHash=$PolicyHash
+    Warnings=@($Warnings)
+    Manifest=@($Manifest)
+    ObjectSummary=$obj
+    SchemaSummary=$sch
+    DatabaseSummary=$db
+    VariantSummary=@($variants)
+    VariantDifferences=@($diffs)
 }
