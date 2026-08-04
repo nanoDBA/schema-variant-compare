@@ -3,7 +3,7 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string[]] $SqlInstance,
+    [Parameter(Mandatory)][object[]] $SqlInstance,
     [Parameter(Mandatory)][string] $Database,
     [string] $CollectorPath = (Join-Path $PSScriptRoot 'sqlserver/Get-SchemaManifest.sql'),
     [PSCredential] $SqlCredential
@@ -49,11 +49,32 @@ function Get-PolicyHash {
     Get-Sha256Hex -Text ($signature -join "`n")
 }
 
+function Test-DbNull {
+    param($Value)
+
+    return (
+        $null -eq $Value -or
+        $Value -is [System.DBNull]
+    )
+}
+
 function Get-ComponentKey {
     param([Parameter(Mandatory)] $Row)
+
+    $ordinal = if (Test-DbNull $Row.Ordinal) {
+        -1
+    }
+    else {
+        [int]$Row.Ordinal
+    }
+
     '{0}|{1}|{2}|{3}|{4}|{5:D10}' -f @(
-        $Row.ObjectCategory,$Row.SchemaName,$Row.ObjectName,
-        $Row.ComponentCategory,$Row.ComponentName,[int]($Row.Ordinal ?? -1)
+        $Row.ObjectCategory,
+        $Row.SchemaName,
+        $Row.ObjectName,
+        $Row.ComponentCategory,
+        $Row.ComponentName,
+        $ordinal
     )
 }
 
@@ -137,12 +158,12 @@ function Compare-ManifestRows {
             ObjectName=$row.ObjectName; ComponentCategory=$row.ComponentCategory
             ComponentName=$row.ComponentName; Ordinal=$row.Ordinal
             DifferenceType=$type
-            LeftRawDefinition=$l?.RawDefinition
-            RightRawDefinition=$r?.RawDefinition
-            LeftDefinition=$l?.CanonicalDefinition
-            RightDefinition=$r?.CanonicalDefinition
-            LeftComponentHash=$l?.ComponentHash
-            RightComponentHash=$r?.ComponentHash
+            LeftRawDefinition = if ($null -eq $l) { $null } else { $l.RawDefinition }
+            RightRawDefinition = if ($null -eq $r) { $null } else { $r.RawDefinition }
+            LeftDefinition = if ($null -eq $l) { $null } else { $l.CanonicalDefinition }
+            RightDefinition = if ($null -eq $r) { $null } else { $r.CanonicalDefinition }
+            LeftComponentHash = if ($null -eq $l) { $null } else { $l.ComponentHash }
+            RightComponentHash = if ($null -eq $r) { $null } else { $r.ComponentHash }
         }
     }
 }
@@ -184,8 +205,8 @@ foreach($instance in $SqlInstance){
             ObjectName=[string]$item.ObjectName
             ComponentCategory=[string]$item.ComponentCategory
             ComponentName=[string]$item.ComponentName
-            Ordinal=if($null -eq $item.Ordinal){$null}else{[int]$item.Ordinal}
-            DiagnosticOrdinal=if($null -eq $item.DiagnosticOrdinal){$null}else{[int]$item.DiagnosticOrdinal}
+            Ordinal=if(Test-DbNull $item.Ordinal){$null}else{[int]$item.Ordinal}
+            DiagnosticOrdinal=if(Test-DbNull $item.DiagnosticOrdinal){$null}else{[int]$item.DiagnosticOrdinal}
             RawDefinition=[string]$item.RawDefinition
             CanonicalDefinition=$definition
             ComponentHash=Get-Sha256Hex $definition
@@ -231,3 +252,5 @@ if(@($variants).Count -gt 1){
     VariantSummary=@($variants)
     VariantDifferences=@($diffs)
 }
+
+

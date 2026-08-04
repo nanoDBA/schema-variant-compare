@@ -182,7 +182,7 @@ INSERT #Manifest
 SELECT
     'MANIFEST','TABLE',s.name,t.name,'INDEX',i.name,NULL,NULL,
     CONCAT('name=',QUOTENAME(i.name),';type=',i.type_desc,';keys=',COALESCE(k.KeyColumns,''),
-           ';includes=',COALESCE(x.IncludeColumnsByOrdinal,''),';'),
+           ';includes=',COALESCE(include_raw.IncludeColumnsByOrdinal,''),';'),
     CONCAT('name=',QUOTENAME(i.name),
            ';type=',i.type_desc,
            ';unique=',CONVERT(tinyint,i.is_unique),
@@ -190,7 +190,7 @@ SELECT
            ';ignore_dup_key=',CONVERT(tinyint,i.ignore_dup_key),
            ';filter=',COALESCE(LTRIM(RTRIM(i.filter_definition)),'<NULL>'),
            ';keys=',COALESCE(k.KeyColumns,''),
-           ';includes=',COALESCE(x.IncludeColumnsCanonical,''),';'),
+           ';includes=',COALESCE(include_canonical.IncludeColumnsCanonical,''),';'),
     NULL,NULL
 FROM sys.indexes i
 JOIN sys.tables t ON t.object_id=i.object_id
@@ -204,14 +204,33 @@ OUTER APPLY (
     JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
     WHERE ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.key_ordinal>0
 ) k
-OUTER APPLY (
+OUTER APPLY
+(
     SELECT
-      STRING_AGG(QUOTENAME(c.name),',') WITHIN GROUP (ORDER BY ic.index_column_id) IncludeColumnsByOrdinal,
-      STRING_AGG(QUOTENAME(c.name),',') WITHIN GROUP (ORDER BY c.name) IncludeColumnsCanonical
-    FROM sys.index_columns ic
-    JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
-    WHERE ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.is_included_column=1
-) x
+        STRING_AGG(QUOTENAME(c.name), ',')
+            WITHIN GROUP (ORDER BY ic.index_column_id) AS IncludeColumnsByOrdinal
+    FROM sys.index_columns AS ic
+    JOIN sys.columns AS c
+        ON c.object_id = ic.object_id
+       AND c.column_id = ic.column_id
+    WHERE ic.object_id = i.object_id
+      AND ic.index_id = i.index_id
+      AND ic.is_included_column = 1
+) AS include_raw
+
+OUTER APPLY
+(
+    SELECT
+        STRING_AGG(QUOTENAME(c.name), ',')
+            WITHIN GROUP (ORDER BY c.name) AS IncludeColumnsCanonical
+    FROM sys.index_columns AS ic
+    JOIN sys.columns AS c
+        ON c.object_id = ic.object_id
+       AND c.column_id = ic.column_id
+    WHERE ic.object_id = i.object_id
+      AND ic.index_id = i.index_id
+      AND ic.is_included_column = 1
+) AS include_canonical
 WHERE t.is_ms_shipped=0
   AND i.index_id>0
   AND i.type IN (1,2)
@@ -255,3 +274,4 @@ SELECT *
 FROM #Manifest
 ORDER BY CASE RowType WHEN 'MANIFEST' THEN 0 ELSE 1 END,
          SchemaName,ObjectName,ComponentCategory,ISNULL(Ordinal,-1),ComponentName,WarningCode;
+
